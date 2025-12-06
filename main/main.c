@@ -5,8 +5,20 @@
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_http_server.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "nvs_flash.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
+#include "lwip/ip4_addr.h"
+#include "lwip/inet.h"
+
+#include "web_page.h"
 
 #define I2C_MASTER_SCL_IO GPIO_NUM_22
 #define I2C_MASTER_SDA_IO GPIO_NUM_21
@@ -24,7 +36,20 @@
 #define BME280_REG_CONFIG 0xF5
 #define BME280_REG_PRESS_MSB 0xF7
 
+
+#define WIFI_SSID "TP-Link_6AFA" 
+#define WIFI_PASSWORD "30012882" 
+#define MAX_STA_CONN 1
+
 static const char *TAG = "weather_station";
+
+static httpd_handle_t s_httpd_handle = NULL;
+static EventGroupHandle_t s_wifi_event_group;
+const int WIFI_CONNECTED_BIT = BIT0;
+
+static double s_last_temperature = 0.0;
+static double s_last_pressure = 0.0;
+static double s_last_humidity = 0.0;
 
 typedef struct {
     uint16_t dig_T1;
@@ -190,17 +215,127 @@ static esp_err_t bme280_read_measurements(double *temperature, double *pressure,
     *pressure = compensate_pressure(adc_P);
     *humidity = compensate_humidity(adc_H);
 
+    // Обновляем глобальные переменные
+    s_last_temperature = *temperature;
+    s_last_pressure = *pressure;
+    s_last_humidity = *humidity;
+
     return ESP_OK;
 }
 
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        esp_wifi_connect();
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        ESP_LOGI(TAG, "Retry connecting to WiFi...");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static void wifi_init_sta(void) {
+    s_wifi_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    strcpy((char*)wifi_config.sta.ssid, WIFI_SSID);
+    strcpy((char*)wifi_config.sta.password, WIFI_PASSWORD);
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "WiFi initialization finished");
+    ESP_LOGI(TAG, "Connecting to WiFi SSID: %s", WIFI_SSID);
+}
+
+static esp_err_t http_get_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, HTML_PAGE, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t http_api_data_handler(httpd_req_t *req) {
+    char response[200];
+    snprintf(response, sizeof(response),
+             "{\"temperature\":%.2f,\"pressure\":%.2f,\"humidity\":%.2f}",
+             s_last_temperature, s_last_pressure, s_last_humidity);
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static httpd_handle_t start_webserver(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+
+    httpd_handle_t server = NULL;
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t index_uri = {
+            .uri = "/",
+            .method = HTTP_GET,
+            .handler = http_get_handler,
+        };
+        httpd_register_uri_handler(server, &index_uri);
+
+        httpd_uri_t api_uri = {
+            .uri = "/api/data",
+            .method = HTTP_GET,
+            .handler = http_api_data_handler,
+        };
+        httpd_register_uri_handler(server, &api_uri);
+
+        ESP_LOGI(TAG, "HTTP server started on port 80");
+        return server;
+    }
+
+    ESP_LOGE(TAG, "Error starting HTTP server");
+    return NULL;
+}
+
+static void stop_webserver(httpd_handle_t server) {
+    if (server) {
+        httpd_stop(server);
+    }
+}
+
 void app_main(void) {
+    ESP_ERROR_CHECK(nvs_flash_init());
+
     ESP_ERROR_CHECK(i2c_master_init());
     ESP_ERROR_CHECK(bme280_init());
+
+    wifi_init_sta();
+
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
+                        false, false, portMAX_DELAY);
+
+    s_httpd_handle = start_webserver();
 
     while (true) {
         double temperature = 0, pressure = 0, humidity = 0;
         if (bme280_read_measurements(&temperature, &pressure, &humidity) == ESP_OK) {
-            ESP_LOGI(TAG, "Temperature: %.2f °C | Pressure: %.2f hPa | Humidity: %.2f %%", temperature, pressure, humidity);
+            ESP_LOGI(TAG, "Temperature: %.2f °C | Pressure: %.2f hPa | Humidity: %.2f %%", 
+                     temperature, pressure, humidity);
         } else {
             ESP_LOGW(TAG, "Failed to read BME280 data");
         }
