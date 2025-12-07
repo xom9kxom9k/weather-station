@@ -36,9 +36,8 @@
 #define BME280_REG_CONFIG 0xF5
 #define BME280_REG_PRESS_MSB 0xF7
 
+#include "wifi_config.h"
 
-#define WIFI_SSID "TP-Link_6AFA" 
-#define WIFI_PASSWORD "30012882" 
 #define MAX_STA_CONN 1
 
 static const char *TAG = "weather_station";

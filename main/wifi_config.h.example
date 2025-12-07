@@ -1,0 +1,11 @@
+#ifndef WIFI_CONFIG_H
+#define WIFI_CONFIG_H
+
+// Настройки WiFi
+// Скопируйте этот файл в wifi_config.h и укажите свои данные
+
+#define WIFI_SSID "YOUR_WIFI_SSID" 
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD" 
+
+#endif // WIFI_CONFIG_H
+
