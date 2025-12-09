@@ -18,6 +18,7 @@
 #include "lwip/ip4_addr.h"
 #include "lwip/inet.h"
 
+#include "mqtt_client.h"
 #include "web_page.h"
 
 #define I2C_MASTER_SCL_IO GPIO_NUM_22
@@ -39,6 +40,7 @@
 #include "wifi_config.h"
 
 #define MAX_STA_CONN 1
+#define MQTT_BROKER_URI "mqtt://192.168.0.101"
 
 static const char *TAG = "weather_station";
 
@@ -49,6 +51,7 @@ const int WIFI_CONNECTED_BIT = BIT0;
 static double s_last_temperature = 0.0;
 static double s_last_pressure = 0.0;
 static double s_last_humidity = 0.0;
+static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 
 typedef struct {
     uint16_t dig_T1;
@@ -317,6 +320,35 @@ static void stop_webserver(httpd_handle_t server) {
     }
 }
 
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
+    ESP_LOGD(TAG, "Event loop base=%s, event_id=%d", base, (int)event_id);
+    esp_mqtt_event_handle_t event = event_data;
+    switch ((esp_mqtt_event_id_t)event_id) {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+        break;
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+        break;
+    case MQTT_EVENT_ERROR:
+        ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
+        break;
+    default:
+        ESP_LOGI(TAG, "Other MQTT event id:%d", event->event_id);
+        break;
+    }
+}
+
+static void mqtt_app_start(void) {
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = MQTT_BROKER_URI,
+    };
+
+    s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(s_mqtt_client);
+}
+
 void app_main(void) {
     ESP_ERROR_CHECK(nvs_flash_init());
 
@@ -329,12 +361,20 @@ void app_main(void) {
                         false, false, portMAX_DELAY);
 
     s_httpd_handle = start_webserver();
+    mqtt_app_start();
 
     while (true) {
         double temperature = 0, pressure = 0, humidity = 0;
         if (bme280_read_measurements(&temperature, &pressure, &humidity) == ESP_OK) {
             ESP_LOGI(TAG, "Temperature: %.2f °C | Pressure: %.2f hPa | Humidity: %.2f %%", 
                      temperature, pressure, humidity);
+            
+            if (s_mqtt_client) {
+                char payload[100];
+                snprintf(payload, sizeof(payload), "{\"temperature\":%.2f,\"pressure\":%.2f,\"humidity\":%.2f}",
+                         temperature, pressure, humidity);
+                esp_mqtt_client_publish(s_mqtt_client, "weather/data", payload, 0, 1, 0);
+            }
         } else {
             ESP_LOGW(TAG, "Failed to read BME280 data");
         }
